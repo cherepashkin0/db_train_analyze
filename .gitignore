@@ -1,3 +1,6 @@
 .env
 .csv
-
+__pycache__/
+clickhouse_data/
+logs/
+dbt/
