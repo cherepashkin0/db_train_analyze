@@ -2,6 +2,7 @@
 
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from zoneinfo import ZoneInfo 
 
 def parse_db_xml(xml_string, city_name):
     if not xml_string:
@@ -13,10 +14,13 @@ def parse_db_xml(xml_string, city_name):
         print(f"Error parsing XML: {e}")
         return []
 
+    # Опредяляем часовые пояса
+    berlin_tz = ZoneInfo("Europe/Berlin")
+    utc_tz = ZoneInfo("UTC")
+
     records = []
     
     for s in root.findall(".//s"):
-        # 1. ID и Тип
         raw_id = s.attrib.get('id', 'unknown')
         tl = s.find("tl")
         train_type = tl.attrib.get('c', 'Train') if tl is not None else "Train"
@@ -24,56 +28,74 @@ def parse_db_xml(xml_string, city_name):
         
         full_train_id = f"{train_type} {train_number}".strip() or raw_id
 
-        # 2. Поиск времени и статуса отмены
-        # ar = arrival (прибытие), dp = departure (отправление)
         ar = s.find("ar")
         dp = s.find("dp")
         
-        # Предпочитаем отправление (dp), если это не конечная станция
+        # --- Маршрут ---
+        origin = city_name
+        destination = city_name
+
+        if ar is not None:
+            ppth_ar = ar.attrib.get('ppth', '')
+            if ppth_ar:
+                origin = ppth_ar.split('|')[0]
+
+        if dp is not None:
+            ppth_dp = dp.attrib.get('ppth', '')
+            if ppth_dp:
+                destination = ppth_dp.split('|')[-1]
+        # ----------------
+
         target_node = dp if dp is not None else ar
-        
-        # По умолчанию поезд не отменен
         is_cancelled = 0
         
-        # В IRIS 'cs' или 'cp' со значением 'c' означает отмену
         if target_node is not None:
-            # Проверяем атрибуты отмены (cs - cancelled stop, cp - cancelled platform)
             if target_node.attrib.get('cs') == 'c' or target_node.attrib.get('cp') == 'c':
                 is_cancelled = 1
-            
-            # Также статус может быть в родительском теге <s>
-            if s.attrib.get('bs') == 'c': # bs - busy status (иногда используется для отмен)
+            if s.attrib.get('bs') == 'c':
                  is_cancelled = 1
 
             pt_str = target_node.attrib.get('pt')
             ct_str = target_node.attrib.get('ct')
             
-            # Если поезд отменен, ct (changed time) часто нет. Берем плановое.
             if not ct_str:
                 ct_str = pt_str
 
             if pt_str and ct_str:
                 try:
                     fmt = "%y%m%d%H%M"
-                    dt_planned = datetime.strptime(pt_str, fmt)
-                    dt_actual = datetime.strptime(ct_str, fmt)
+                    # 1. Парсим "наивную" дату (как и раньше)
+                    dt_planned_naive = datetime.strptime(pt_str, fmt)
+                    dt_actual_naive = datetime.strptime(ct_str, fmt)
                     
-                    delay = int((dt_actual - dt_planned).total_seconds() / 60)
+                    # 2. Присваиваем ей Берлинский часовой пояс
+                    dt_planned_berlin = dt_planned_naive.replace(tzinfo=berlin_tz)
+                    dt_actual_berlin = dt_actual_naive.replace(tzinfo=berlin_tz)
                     
-                    # Если поезд отменен, задержка не имеет смысла (или можно ставить 0)
+                    # 3. Конвертируем в UTC (так принято хранить в базах данных) 
+                    # ClickHouse Connect сам разберется, если передать объект с timezone, 
+                    # но явная конвертация надежнее.
+                    dt_planned_utc = dt_planned_berlin.astimezone(utc_tz)
+                    dt_actual_utc = dt_actual_berlin.astimezone(utc_tz)
+                    
+                    # Рассчитываем задержку
+                    delay = int((dt_actual_berlin - dt_planned_berlin).total_seconds() / 60)
+                    
                     if is_cancelled:
                         delay = 0
 
                     records.append([
-                        datetime.now(),
+                        datetime.now(utc_tz), # Текущее время тоже в UTC
                         city_name,
                         train_type,
                         full_train_id,
-                        dt_planned,
-                        dt_actual,
+                        dt_planned_utc,
+                        dt_actual_utc, 
                         max(0, delay),
-                        is_cancelled  # <--- НОВОЕ ПОЛЕ
+                        is_cancelled,
+                        origin,
+                        destination
                     ])
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
                     continue
     return records

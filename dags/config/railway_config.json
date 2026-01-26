@@ -1,0 +1,19 @@
+{
+  "stations": {
+    "8011160": "Berlin Hbf",
+    "8000207": "Köln Hbf",
+    "8000261": "München Hbf",
+    "8000105": "Frankfurt (Main) Hbf",
+    "8002549": "Hamburg Hbf",
+    "8000096": "Stuttgart Hbf",
+    "8000244": "Mannheim Hbf",
+    "8000191": "Karlsruhe Hbf",
+    "8000284": "Nürnberg Hbf",
+    "8000152": "Hannover Hbf",
+    "8000080": "Dortmund Hbf",
+    "8000260": "Würzburg Hbf"
+  },
+  "monitored_types": [
+    "ICE", "IC", "EC", "ECE", "RE", "RB", "S", "NX", "FLX", "NJ"
+  ]
+}
