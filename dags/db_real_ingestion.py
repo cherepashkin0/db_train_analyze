@@ -1,5 +1,3 @@
-# db_real_ingestion.py
-
 import asyncio
 import os
 import json
@@ -9,25 +7,20 @@ from api_client import fetch_and_save
 from iris_parser import parse_db_xml
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-# --- ФУНКЦИЯ ЗАГРУЗКИ КОНФИГА ---
+# --- КОНФИГУРАЦИЯ ---
 def load_config():
-    """Загружает конфигурацию станций и типов поездов из JSON файла."""
+    """Загружает конфигурацию станций."""
     base_dir = "/opt/airflow/dags"
     config_path = os.path.join(base_dir, "config", "railway_config.json")
     
     print(f"🔍 Ищу конфиг здесь: {config_path}")
-
-    # === ОТЛАДКА (DEBUG) ===
+    
+    # Отладка путей
     try:
         config_dir = os.path.join(base_dir, "config")
         if os.path.exists(config_dir):
             print(f"📂 Содержимое папки {config_dir}: {os.listdir(config_dir)}")
-        else:
-            print(f"❌ Папка {config_dir} не существует!")
-            print(f"📂 Содержимое корня {base_dir}: {os.listdir(base_dir)}")
-    except Exception as e:
-        print(f"⚠ Ошибка при отладке путей: {e}")
-    # =======================
+    except: pass
 
     if os.path.exists(config_path):
         try:
@@ -36,337 +29,228 @@ def load_config():
                 print(f"✅ Конфиг успешно загружен: {len(config.get('stations', {}))} станций")
                 return config
         except Exception as e:
-            print(f"❌ Файл есть, но ошибка чтения JSON: {e}")
-    else:
-        print("❌ Файл конфига физически отсутствует по этому пути.")
-
-    # Дефолтный конфиг
-    print("⚠ Использую дефолтные значения (12 основных станций).")
+            print(f"❌ Ошибка чтения JSON: {e}")
+    
     return {
-        "stations": {
-            "8011160": "Berlin Hbf",
-            "8000207": "Köln Hbf",
-            "8000261": "München Hbf",
-            "8000105": "Frankfurt (Main) Hbf",
-            "8002549": "Hamburg Hbf",
-            "8000096": "Stuttgart Hbf",
-            "8000244": "Mannheim Hbf",
-            "8000191": "Karlsruhe Hbf",
-            "8000284": "Nürnberg Hbf",
-            "8000152": "Hannover Hbf",
-            "8000080": "Dortmund Hbf",
-            "8000260": "Würzburg Hbf"
-        },
-        "monitored_types": ["ICE", "IC", "EC", "ECE", "RE", "RB", "S", "NX", "FLX", "NJ"],
-        "hours_to_fetch": 6  # Количество часов для загрузки (включая текущий)
+        "stations": {"8011160": "Berlin Hbf"}, 
+        "monitored_types": []
     }
 
-
-# --- ЛОГИРОВАНИЕ В POSTGRES ---
-def log_ingestion_status(context, status, records_count, stations_count=0, error_message=None):
-    """Записывает статус выполнения загрузки в Postgres."""
-    try:
-        pg_hook = PostgresHook(postgres_conn_id='postgres_default')
-        
-        create_sql = """
-        CREATE TABLE IF NOT EXISTS api_ingestion_log (
-            run_id SERIAL PRIMARY KEY,
-            dag_id VARCHAR(50),
-            execution_date TIMESTAMP,
-            status VARCHAR(20),
-            records_count INT,
-            stations_count INT,
-            error_message TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """
-        pg_hook.run(create_sql)
-
-        insert_sql = """
-            INSERT INTO api_ingestion_log 
-            (dag_id, execution_date, status, records_count, stations_count, error_message)
-            VALUES (%s, %s, %s, %s, %s, %s);
-        """
-        
-        dag_id = str(context['dag'].dag_id)
-        execution_date = str(context.get('execution_date', datetime.now()))
-        
-        pg_hook.run(insert_sql, parameters=(
-            dag_id, execution_date, status, records_count, stations_count, error_message
-        ))
-        print(f"📝 Статус '{status}' записан в Postgres (записей: {records_count}).")
-    except Exception as e:
-        print(f"❌ Ошибка записи лога в Postgres: {e}")
-
-
-def build_plan_queries(stations: dict, hours_to_fetch: int = 6) -> list:
-    """
-    Формирует список запросов к /plan/{evaNo}/{date}/{hour} endpoint.
-    
-    Args:
-        stations: Словарь {eva_id: station_name}
-        hours_to_fetch: Количество часов для загрузки (начиная с текущего)
-    
-    Returns:
-        Список словарей с URL и параметрами для каждого запроса
-    """
-    queries = []
-    now = datetime.now()
-    
-    for eva_id, station_name in stations.items():
-        for hour_offset in range(hours_to_fetch):
-            # Вычисляем целевое время
-            target_time = now + timedelta(hours=hour_offset)
-            
-            # Формат даты: YYMMDD
-            date_str = target_time.strftime('%y%m%d')
-            # Формат часа: HH (с ведущим нулём)
-            hour_str = target_time.strftime('%H')
-            
-            queries.append({
-                "url": f"https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/plan/{eva_id}/{date_str}/{hour_str}",
-                "params": {},
-                # Метаданные для удобства обработки результатов
-                "_meta": {
-                    "eva_id": eva_id,
-                    "station_name": station_name,
-                    "date": date_str,
-                    "hour": hour_str,
-                    "type": "plan"
-                }
-            })
-    
-    return queries
-
-
-def build_fchg_queries(stations: dict) -> list:
-    """
-    Формирует список запросов к /fchg/{evaNo} endpoint для получения 
-    актуальных изменений (задержки, отмены, изменения платформ).
-    
-    Args:
-        stations: Словарь {eva_id: station_name}
-    
-    Returns:
-        Список словарей с URL и параметрами
-    """
-    queries = []
-    
-    for eva_id, station_name in stations.items():
-        queries.append({
-            "url": f"https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/fchg/{eva_id}",
-            "params": {},
-            "_meta": {
-                "eva_id": eva_id,
-                "station_name": station_name,
-                "type": "fchg"
-            }
-        })
-    
-    return queries
-
-
-# --- ОСНОВНАЯ ЛОГИКА ---
-async def run_real_ingestion(context):
-    """
-    Основная функция загрузки данных:
-    1. Загружает конфиг со станциями
-    2. Формирует запросы к API:
-       - /plan/{evaNo}/{date}/{hour} — плановое расписание за несколько часов
-       - /fchg/{evaNo} — актуальные изменения (опционально)
-    3. Получает данные из API
-    4. Парсит XML и загружает в ClickHouse
-    """
-    config = load_config()
-    stations = config.get("stations", {})
-    hours_to_fetch = config.get("hours_to_fetch", 6)
-    fetch_realtime_changes = config.get("fetch_realtime_changes", True)
-    
-    # Убираем пустые типы и приводим к set
-    target_types = set(filter(None, config.get("monitored_types", [])))
-    
-    if not stations:
-        error_msg = "CRITICAL: No stations configured!"
-        log_ingestion_status(context, 'FAILED', 0, 0, error_msg)
-        raise Exception(error_msg)
-    
-    # === ФОРМИРОВАНИЕ ЗАПРОСОВ К API ===
-    print(f"\n{'='*60}")
-    print(f"🚂 DEUTSCHE BAHN TIMETABLE INGESTION")
-    print(f"{'='*60}")
-    print(f"📍 Станций: {len(stations)}")
-    print(f"⏰ Часов для загрузки: {hours_to_fetch}")
-    print(f"🔄 Загрузка real-time изменений: {'Да' if fetch_realtime_changes else 'Нет'}")
-    if target_types:
-        print(f"🎯 Фильтр типов поездов: {', '.join(sorted(target_types))}")
-    else:
-        print(f"🎯 Фильтрация типов: отключена (все поезда)")
-    print(f"{'='*60}\n")
-    
-    # Формируем запросы к /plan/ endpoint
-    plan_queries = build_plan_queries(stations, hours_to_fetch)
-    print(f"📋 Сформировано {len(plan_queries)} запросов к /plan/ endpoint")
-    print(f"   ({len(stations)} станций × {hours_to_fetch} часов)")
-    
-    # Опционально добавляем запросы к /fchg/ для real-time данных
-    fchg_queries = []
-    if fetch_realtime_changes:
-        fchg_queries = build_fchg_queries(stations)
-        print(f"📋 Сформировано {len(fchg_queries)} запросов к /fchg/ endpoint")
-    
-    all_queries = plan_queries + fchg_queries
-    print(f"📊 Всего запросов к API: {len(all_queries)}")
-    
-    output_path = "/opt/airflow/data/raw_api_data"
-    
-    # === ЗАГРУЗКА ДАННЫХ ИЗ API ===
-    print(f"\n🌐 Начинаю загрузку данных из API...")
-    
-    df = await fetch_and_save(
-        queries=all_queries,
-        output_path=output_path,
-        max_concurrent=5,   # Ограничиваем concurrency для стабильности
-        rate_limit=60       # DB API limit: 60 запросов/минуту
-    )
-
-    # === ПРОВЕРКА НА ОШИБКИ ===
-    failed_requests = df['error'].notna().sum()
-    total_requests = len(all_queries)
-    successful_requests = total_requests - failed_requests
-    
-    print(f"\n📊 Статистика API запросов:")
-    print(f"   ✅ Успешных: {successful_requests}")
-    print(f"   ❌ Неудачных: {failed_requests}")
-    print(f"   📈 Success rate: {successful_requests/total_requests*100:.1f}%")
-
-    # Если все запросы упали - критическая ошибка
-    if failed_requests == total_requests and total_requests > 0:
-        error_msg = f"CRITICAL: All {total_requests} API requests failed."
-        log_ingestion_status(context, 'FAILED', 0, len(stations), error_msg)
-        raise Exception(error_msg)
-
-    # Если часть запросов упала - логируем детали
-    if failed_requests > 0:
-        print(f"\n⚠ Детали неудачных запросов:")
-        for _, row in df[df['error'].notna()].iterrows():
-            print(f"   - {row['url']}: {row['error']}")
-
-    # === ПОДКЛЮЧЕНИЕ К CLICKHOUSE ===
-    client = clickhouse_connect.get_client(
+# --- HELPER: CLICKHOUSE CLIENT ---
+def get_ch_client():
+    return clickhouse_connect.get_client(
         host=os.getenv('CLICKHOUSE_HOST', 'clickhouse'),
-        port=8123,
         username=os.getenv('CLICKHOUSE_USER', 'default'),
         password=os.getenv('CLICKHOUSE_PASSWORD')
     )
 
-    # === ПАРСИНГ И ФИЛЬТРАЦИЯ ДАННЫХ ===
-    print(f"\n🔄 Парсинг XML ответов...")
+# --- ЛОГИРОВАНИЕ ---
+def log_status(context, stage, status, msg=""):
+    """Пишет статус этапа в консоль и в Postgres."""
+    print(f"[{stage}] {status}: {msg}")
     
-    all_parsed_data = []
-    stations_with_data = set()
-    plan_records = 0
-    fchg_records = 0
-    
-    for _, row in df.iterrows():
-        # Пропускаем упавшие запросы
-        if row['error']:
-            continue
+    try:
+        pg_hook = PostgresHook(postgres_conn_id='postgres_default')
+        sql = """
+            INSERT INTO api_ingestion_log (dag_id, execution_date, status, error_message)
+            VALUES (%s, %s, %s, %s)
+        """
+        dag_id = str(context['dag'].dag_id)
+        execution_date = str(context.get('execution_date', datetime.now()))
+        
+        pg_hook.run("""
+            CREATE TABLE IF NOT EXISTS api_ingestion_log (
+                run_id SERIAL PRIMARY KEY,
+                dag_id VARCHAR(50),
+                execution_date VARCHAR(50),
+                status VARCHAR(20),
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        
+        pg_hook.run(sql, parameters=(dag_id, execution_date, status, f"{stage}: {msg}"))
+    except Exception as e:
+        print(f"⚠ Ошибка записи лога в Postgres: {e}")
 
-        # Извлекаем метаданные из URL
-        url_parts = row['url'].split('/')
-        
-        # Определяем тип запроса и извлекаем EVA ID
-        if '/plan/' in row['url']:
-            # URL: .../plan/{evaNo}/{date}/{hour}
-            eva_id = url_parts[-3]
-            request_type = "plan"
-            date_hour = f"{url_parts[-2]}/{url_parts[-1]}"
-        elif '/fchg/' in row['url']:
-            # URL: .../fchg/{evaNo}
-            eva_id = url_parts[-1]
-            request_type = "fchg"
-            date_hour = "realtime"
-        else:
-            print(f"  ⚠ Неизвестный формат URL: {row['url']}")
-            continue
-        
+# ==========================================
+# 1. EXTRACT DATA (API -> Parquet/Bronze)
+# ==========================================
+async def extract_data(config):
+    stations = config.get("stations", {})
+    queries = []
+    for eva_id in stations.keys():
+        queries.append({"url": f"https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/fchg/{eva_id}"})
+    
+    print(f"🌍 TASK 1: EXTRACT. Загрузка данных для {len(stations)} станций...")
+    return await fetch_and_save(
+        queries=queries,
+        output_path="/opt/airflow/data/raw_api_data",
+        max_concurrent=5,
+        rate_limit=60
+    )
+
+# ==========================================
+# 2. LOAD TO SILVER (Parquet -> ClickHouse Raw)
+# ==========================================
+def load_to_silver(df, config):
+    print("📥 TASK 2: LOAD TO SILVER...")
+    stations = config.get("stations", {})
+    target_types = set(config.get("monitored_types", []))
+    
+    all_parsed = []
+    for _, row in df.iterrows():
+        if row['error']: continue
+        eva_id = row['url'].split('/')[-1]
         city = stations.get(eva_id, "Unknown")
         
         if row['response_data']:
-            # === ОТЛАДКА: показываем превью XML ===
-            xml_length = len(row['response_data'])
-            if xml_length > 0:
-                xml_preview = row['response_data'][:300] if xml_length > 300 else row['response_data']
-                # Убираем переносы строк для компактности
-                xml_preview_clean = ' '.join(xml_preview.split())
-                print(f"\n  📄 {city} [{request_type}] ({date_hour}):")
-                print(f"     XML size: {xml_length} chars")
-                print(f"     Preview: {xml_preview_clean[:150]}...")
+            rows = parse_db_xml(row['response_data'], city)
+            if target_types:
+                rows = [r for r in rows if r[2] in target_types]
+            all_parsed.extend(rows)
             
-            # Парсим XML ответ
-            parsed_rows = parse_db_xml(row['response_data'], city)
-            
-            if parsed_rows:
-                print(f"     Parsed: {len(parsed_rows)} записей")
-                
-                # Применяем фильтрацию по типам поездов
-                if target_types:
-                    before_filter = len(parsed_rows)
-                    parsed_rows = [r for r in parsed_rows if r[2] in target_types]
-                    after_filter = len(parsed_rows)
-                    if before_filter != after_filter:
-                        print(f"     Filtered: {before_filter} → {after_filter} записей")
-                
-                if parsed_rows:
-                    all_parsed_data.extend(parsed_rows)
-                    stations_with_data.add(city)
-                    
-                    if request_type == "plan":
-                        plan_records += len(parsed_rows)
-                    else:
-                        fchg_records += len(parsed_rows)
-            else:
-                print(f"     ⚠ Парсер не вернул данных")
+    if not all_parsed:
+        print("⚠ LOAD: Нет данных для вставки.")
+        return 0
 
-    total_records = len(all_parsed_data)
+    client = get_ch_client()
     
-    print(f"\n{'='*60}")
-    print(f"📈 ИТОГОВАЯ СТАТИСТИКА:")
-    print(f"   Станций запрошено: {len(stations)}")
-    print(f"   Станций с данными: {len(stations_with_data)}")
-    print(f"   Записей из /plan/: {plan_records}")
-    print(f"   Записей из /fchg/: {fchg_records}")
-    print(f"   ВСЕГО записей: {total_records}")
-    if target_types:
-        print(f"   Типы поездов: {', '.join(sorted(target_types))}")
-    print(f"{'='*60}\n")
+    client.insert('train_delays', all_parsed, 
+                  column_names=['timestamp', 'city', 'train_type', 'train_id', 
+                                'planned_departure', 'actual_departure', 
+                                'delay_in_min', 'is_cancelled', 'origin', 'destination'])
+    print(f"✅ LOAD: Вставлено {len(all_parsed)} строк в Silver слой (train_delays).")
+    return len(all_parsed)
 
-    # === ЗАГРУЗКА В CLICKHOUSE ===
-    if all_parsed_data:
+# ==========================================
+# 3. DATA QUALITY CHECK (Validation)
+# ==========================================
+def data_quality_check():
+    print("🧐 TASK 3: DATA QUALITY CHECK...")
+    client = get_ch_client()
+    
+    # === НОВЫЕ ТЕСТЫ ===
+    checks = [
+        # 1. Validate for Nulls (Пустые ID поездов или городов)
+        ("Null Check: Train IDs", 
+         "SELECT count() FROM train_delays WHERE train_id = '' AND actual_departure > now() - INTERVAL 1 HOUR"),
+         
+        ("Null Check: Cities", 
+         "SELECT count() FROM train_delays WHERE city = '' AND actual_departure > now() - INTERVAL 1 HOUR"),
+
+        # 2. Test Range Constraints (Задержка должна быть адекватной)
+        ("Range Check: Negative Delays", 
+         "SELECT count() FROM train_delays WHERE delay_in_min < 0"),
+         
+        ("Range Check: Extreme Delays (>1000 min)", 
+         "SELECT count() FROM train_delays WHERE delay_in_min > 1000 AND actual_departure > now() - INTERVAL 1 HOUR"),
+         
+        ("Range Check: Future Data (>2 Days)", 
+         "SELECT count() FROM train_delays WHERE actual_departure > now() + INTERVAL 2 DAY"),
+
+        # 3. Verify Referential Integrity (Проверяем, что город известен)
+        ("Ref Integrity: Unknown Stations", 
+         "SELECT count() FROM train_delays WHERE city = 'Unknown' AND actual_departure > now() - INTERVAL 1 HOUR")
+    ]
+    
+    failed_checks = []
+    
+    for check_name, sql in checks:
         try:
-            client.insert(
-                'train_delays', 
-                all_parsed_data, 
-                column_names=[
-                    'timestamp', 'city', 'train_type', 'train_id', 
-                    'planned_departure', 'actual_departure', 
-                    'delay_in_min', 'is_cancelled',
-                    'origin', 'destination'
-                ]
-            )
-            print(f"✅ Успешно загружено {total_records} строк в ClickHouse.")
-            log_ingestion_status(context, 'SUCCESS', total_records, len(stations_with_data))
+            # Получаем результат (число строк, нарушающих правило)
+            result = client.query(sql).result_rows[0][0]
+            
+            if result > 0:
+                msg = f"❌ DQ FAIL: {check_name} -> найдено {result} плохих записей"
+                print(msg)
+                # Для некоторых проверок можно не ронять пайплайн, а просто алертить
+                # Но для строгих требований спринта - добавляем в список ошибок
+                failed_checks.append(msg)
+            else:
+                print(f"✅ DQ PASS: {check_name}")
+                
         except Exception as e:
-            error_msg = f"Failed to insert into ClickHouse: {str(e)}"
-            print(f"❌ {error_msg}")
-            log_ingestion_status(context, 'FAILED', 0, len(stations_with_data), error_msg)
-            raise
-    else:
-        warning_msg = "API ответил успешно, но данных нет (или все отфильтрованы)."
-        print(f"⚠ {warning_msg}")
-        log_ingestion_status(context, 'WARNING', 0, len(stations_with_data), warning_msg)
+            print(f"⚠ Ошибка при выполнении проверки {check_name}: {e}")
+            failed_checks.append(f"SQL Error in {check_name}: {e}")
+            
+    if failed_checks:
+        # Роняем пайплайн, если есть ошибки качества
+        raise Exception(f"Data Quality Checks Failed:\n" + "\n".join(failed_checks))
 
+# ==========================================
+# 4. TRANSFORM GOLD (Silver -> Aggregated)
+# ==========================================
+def transform_gold():
+    print("🔨 TASK 4: TRANSFORM GOLD...")
+    client = get_ch_client()
+    
+    query = """
+    INSERT INTO daily_train_stats
+    SELECT
+        toDate(actual_departure) as stat_date,
+        city,
+        train_type,
+        count() as total_trains,
+        countIf(delay_in_min > 0) as delayed_trains,
+        avgIf(delay_in_min, delay_in_min > 0) as avg_delay,
+        max(delay_in_min) as max_delay,
+        now() as created_at
+    FROM train_delays
+    WHERE actual_departure >= toStartOfDay(now())
+    GROUP BY stat_date, city, train_type
+    """
+    
+    client.command("ALTER TABLE daily_train_stats DELETE WHERE stat_date = toDate(now())")
+    client.command(query)
+    print("✅ TRANSFORM: Gold слой (daily_train_stats) обновлен.")
+
+# --- ORCHESTRATOR (Внутри скрипта) ---
+# Примечание: Чтобы видеть эти шаги графически в Airflow, 
+# нужно вызывать extract_data, load_to_silver и т.д. 
+# отдельными PythonOperator в файле DAG, а не здесь.
+# Но пока оставляем так для работоспособности текущего кода.
+
+async def run_pipeline(context):
+    config = load_config()
+    
+    # 1. EXTRACT
+    try:
+        df = await extract_data(config)
+        
+        # Tech Check: API health
+        failed_count = df['error'].notna().sum()
+        if failed_count == len(df) and len(df) > 0:
+            raise Exception("CRITICAL: Все запросы к API упали.")
+        if failed_count > 0:
+            print(f"⚠ WARNING: {failed_count}/{len(df)} запросов с ошибкой.")
+    except Exception as e:
+        log_status(context, "EXTRACT", "FAILED", str(e))
+        raise
+
+    # 2. LOAD
+    try:
+        count = load_to_silver(df, config)
+    except Exception as e:
+        log_status(context, "LOAD", "FAILED", str(e))
+        raise
+
+    # 3. DQ CHECK
+    if count > 0:
+        try:
+            data_quality_check()
+        except Exception as e:
+            log_status(context, "DQ_CHECK", "FAILED", str(e))
+            raise
+
+        # 4. TRANSFORM
+        try:
+            transform_gold()
+        except Exception as e:
+            log_status(context, "TRANSFORM", "FAILED", str(e))
+            raise
+            
+    log_status(context, "PIPELINE", "SUCCESS", f"Processed {count} records")
 
 def main(**kwargs):
-    """Entry point для Airflow DAG."""
-    asyncio.run(run_real_ingestion(kwargs))
+    asyncio.run(run_pipeline(kwargs))
