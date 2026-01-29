@@ -1,66 +1,326 @@
+"""
+Deutsche Bahn Train Delays Pipeline
+====================================
+Medallion Architecture: Bronze -> Silver -> Gold
+
+Bronze: Raw API data extraction (no transformation)
+Silver: Parsing, cleaning, validation, business rules
+Gold: Aggregated metrics for dashboards
+"""
+
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
 import asyncio
 import os
 import json
 import clickhouse_connect
-from datetime import datetime, timedelta
-from api_client import generate_plan_queries, fetch_and_save
+from api_client import generate_plan_queries, generate_fchg_queries, fetch_and_save
 from iris_parser import parse_plan_xml, parse_fchg_xml
-from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-# --- КОНФИГУРАЦИЯ ---
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+DAG_ID = 'db_train_medallion_pipeline'
+BRONZE_PATH = "/opt/airflow/data/bronze/train_api"
+CONFIG_PATH = "/opt/airflow/dags/config/railway_config.json"
+
+
 def load_config():
-    """Загружает конфигурацию станций."""
-    base_dir = "/opt/airflow/dags"
-    config_path = os.path.join(base_dir, "config", "railway_config.json")
-    
-    print(f"🔍 Ищу конфиг здесь: {config_path}")
-    
-    try:
-        config_dir = os.path.join(base_dir, "config")
-        if os.path.exists(config_dir):
-            print(f"📂 Содержимое папки {config_dir}: {os.listdir(config_dir)}")
-    except: pass
+    """Load station configuration."""
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"stations": {"8011160": "Berlin Hbf"}, "monitored_types": [], "hours_back": 12, "hours_forward": 12}
 
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                print(f"✅ Конфиг успешно загружен: {len(config.get('stations', {}))} станций")
-                return config
-        except Exception as e:
-            print(f"❌ Ошибка чтения JSON: {e}")
-    
-    return {
-        "stations": {"8011160": "Berlin Hbf"}, 
-        "monitored_types": []
-    }
 
-# --- HELPER: CLICKHOUSE CLIENT ---
 def get_ch_client():
+    """Get ClickHouse client."""
     return clickhouse_connect.get_client(
         host=os.getenv('CLICKHOUSE_HOST', 'clickhouse'),
         username=os.getenv('CLICKHOUSE_USER', 'default'),
         password=os.getenv('CLICKHOUSE_PASSWORD')
     )
 
-def ensure_clickhouse_tables():
-    """Создаёт таблицы в ClickHouse если их нет."""
+
+def log_pipeline_stage(dag_id: str, stage: str, status: str, records_processed: int = 0, error_message: str = None):
+    """Log pipeline stage to Postgres metadata table."""
+    try:
+        pg_hook = PostgresHook(postgres_conn_id='postgres_default')
+        
+        # Ensure table exists
+        pg_hook.run("""
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                id SERIAL PRIMARY KEY,
+                dag_id VARCHAR(100),
+                stage VARCHAR(50),
+                status VARCHAR(20),
+                records_processed INTEGER,
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_dag_stage ON pipeline_runs(dag_id, stage, created_at);
+        """)
+        
+        pg_hook.run(
+            """INSERT INTO pipeline_runs (dag_id, stage, status, records_processed, error_message) 
+               VALUES (%s, %s, %s, %s, %s)""",
+            parameters=(dag_id, stage, status, records_processed, error_message)
+        )
+        print(f"📝 Logged: {stage} -> {status} ({records_processed} records)")
+    except Exception as e:
+        print(f"⚠ Failed to log to Postgres: {e}")
+
+
+# =============================================================================
+# BRONZE LAYER: Raw Data Extraction
+# =============================================================================
+
+def bronze_extract(**context):
+    """
+    BRONZE LAYER: Extract raw data from Deutsche Bahn API.
+    
+    - No parsing, no transformation
+    - Just fetch and save raw XML responses to Parquet
+    - Fast failure if API is down
+    """
+    print("=" * 60)
+    print("🥉 BRONZE LAYER: Starting raw data extraction")
+    print("=" * 60)
+    
+    config = load_config()
+    stations = config.get("stations", {})
+    hours_back = config.get("hours_back", 12)
+    hours_forward = config.get("hours_forward", 12)
+    
+    # Generate queries
+    plan_queries = generate_plan_queries(stations, hours_back, hours_forward)
+    fchg_queries = generate_fchg_queries(stations)
+    all_queries = plan_queries + fchg_queries
+    
+    print(f"📡 API Queries:")
+    print(f"   - Stations: {len(stations)}")
+    print(f"   - Plan queries: {len(plan_queries)}")
+    print(f"   - Fchg queries: {len(fchg_queries)}")
+    print(f"   - Total: {len(all_queries)}")
+    
+    # Fetch data
+    async def run_fetch():
+        return await fetch_and_save(
+            queries=all_queries,
+            output_path=BRONZE_PATH,
+            max_concurrent=10,
+            rate_limit=60,
+        )
+    
+    df = asyncio.run(run_fetch())
+    
+    # Check API health
+    total = len(df)
+    failed = df['error'].notna().sum()
+    success = total - failed
+    
+    if total == 0:
+        log_pipeline_stage(DAG_ID, 'bronze', 'FAILED', 0, "No queries generated")
+        raise Exception("CRITICAL: No queries generated")
+    
+    if failed == total:
+        log_pipeline_stage(DAG_ID, 'bronze', 'FAILED', 0, "All API requests failed")
+        raise Exception("CRITICAL: All API requests failed")
+    
+    success_rate = success / total * 100
+    print(f"✅ Bronze complete: {success}/{total} requests successful ({success_rate:.1f}%)")
+    
+    if failed > 0:
+        print(f"⚠ WARNING: {failed} requests failed")
+    
+    # Log success
+    log_pipeline_stage(DAG_ID, 'bronze', 'SUCCESS', success)
+    
+    # Pass data path to next task via XCom
+    context['ti'].xcom_push(key='bronze_path', value=BRONZE_PATH)
+    context['ti'].xcom_push(key='bronze_records', value=total)
+    
+    return total
+
+
+# =============================================================================
+# SILVER LAYER: Parsing, Cleaning, Validation
+# =============================================================================
+
+def silver_transform(**context):
+    """
+    SILVER LAYER: Parse, clean, validate and apply business rules.
+    
+    - Parse XML responses
+    - Clean and normalize data
+    - Apply business rules (merge plan + fchg)
+    - Data quality checks
+    - Load to ClickHouse
+    """
+    print("=" * 60)
+    print("🥈 SILVER LAYER: Starting transformation")
+    print("=" * 60)
+    
+    import pandas as pd
+    import pyarrow.parquet as pq
+    from pathlib import Path
+    
+    config = load_config()
+    target_types = set(config.get("monitored_types", []))
+    
+    # Ensure ClickHouse tables exist
+    ensure_silver_tables()
+    
+    # Read bronze data
+    bronze_path = context['ti'].xcom_pull(key='bronze_path', task_ids='bronze_extract')
+    bronze_path = Path(bronze_path or BRONZE_PATH)
+    
+    print(f"📂 Reading bronze data from: {bronze_path}")
+    
+    # Find all parquet files
+    parquet_files = list(bronze_path.glob("**/*.parquet"))
+    if not parquet_files:
+        log_pipeline_stage(DAG_ID, 'silver', 'FAILED', 0, "No bronze data found")
+        raise Exception("No bronze data found")
+    
+    # Read and combine
+    dfs = [pd.read_parquet(f) for f in parquet_files]
+    df = pd.concat(dfs, ignore_index=True)
+    
+    # Filter to recent data only (last 2 days)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    cutoff = datetime.now() - timedelta(days=2)
+    df = df[df['timestamp'] >= cutoff]
+    
+    print(f"📊 Bronze records loaded: {len(df)}")
+    
+    # --- PARSING ---
+    print("\n🔄 Parsing XML responses...")
+    
+    trains_dict = {}  # Key: (train_id, planned_departure, city) -> row
+    
+    plan_count = 0
+    fchg_count = 0
+    parse_errors = 0
+    
+    for _, row in df.iterrows():
+        if row['error'] or not row['response_data']:
+            continue
+        
+        station_name = row.get('station_name', 'Unknown')
+        query_type = row.get('query_type', 'plan')
+        
+        try:
+            if query_type == 'fchg':
+                rows = parse_fchg_xml(row['response_data'], station_name)
+                fchg_count += len(rows)
+            else:
+                rows = parse_plan_xml(row['response_data'], station_name)
+                plan_count += len(rows)
+            
+            # Filter by train type if configured
+            if target_types:
+                rows = [r for r in rows if r[2] in target_types]
+            
+            # Merge: fchg overwrites plan
+            for row_data in rows:
+                key = (row_data[3], row_data[4], row_data[1])  # (train_id, planned_departure, city)
+                if query_type == 'fchg':
+                    trains_dict[key] = row_data
+                elif key not in trains_dict:
+                    trains_dict[key] = row_data
+                    
+        except Exception as e:
+            parse_errors += 1
+            if parse_errors <= 5:
+                print(f"⚠ Parse error for {station_name}: {e}")
+    
+    print(f"\n📈 Parsing results:")
+    print(f"   - Plan records: {plan_count}")
+    print(f"   - Fchg records: {fchg_count}")
+    print(f"   - Parse errors: {parse_errors}")
+    print(f"   - Unique trains after merge: {len(trains_dict)}")
+    
+    if not trains_dict:
+        log_pipeline_stage(DAG_ID, 'silver', 'FAILED', 0, "No records after parsing")
+        raise Exception("No records after parsing")
+    
+    all_records = list(trains_dict.values())
+    
+    # --- DATA QUALITY CHECKS ---
+    print("\n🧪 Running data quality checks...")
+    
+    dq_results = run_silver_dq_checks(all_records)
+    
+    if dq_results['critical_failures']:
+        error_msg = "; ".join(dq_results['critical_failures'])
+        log_pipeline_stage(DAG_ID, 'silver', 'FAILED', 0, f"DQ Failed: {error_msg}")
+        raise Exception(f"Data Quality Failed: {error_msg}")
+    
+    # Filter out bad records
+    clean_records = dq_results['clean_records']
+    
+    print(f"\n✅ DQ passed: {len(clean_records)} clean records (removed {len(all_records) - len(clean_records)} bad)")
+    
+    # --- LOAD TO CLICKHOUSE ---
+    print("\n💾 Loading to ClickHouse Silver layer...")
+    
     client = get_ch_client()
     
-    # Проверяем, нужна ли миграция train_delays на ReplacingMergeTree
+    client.insert('train_delays', clean_records,
+                  column_names=['timestamp', 'city', 'train_type', 'train_id',
+                                'planned_departure', 'actual_departure',
+                                'delay_in_min', 'is_cancelled', 'origin', 'destination'])
+    
+    # Deduplicate
+    client.command("OPTIMIZE TABLE train_delays FINAL")
+    
+    # Statistics
+    delayed_count = sum(1 for r in clean_records if r[6] > 5)
+    cancelled_count = sum(1 for r in clean_records if r[7] == 1)
+    
+    print(f"\n📊 Silver layer statistics:")
+    print(f"   - Total records: {len(clean_records)}")
+    print(f"   - Delayed (>5min): {delayed_count}")
+    print(f"   - Cancelled: {cancelled_count}")
+    
+    log_pipeline_stage(DAG_ID, 'silver', 'SUCCESS', len(clean_records))
+    
+    context['ti'].xcom_push(key='silver_records', value=len(clean_records))
+    context['ti'].xcom_push(key='silver_delayed', value=delayed_count)
+    
+    return len(clean_records)
+
+
+def ensure_silver_tables():
+    """Create ClickHouse tables if not exist."""
+    client = get_ch_client()
+    
+    # Check if migration needed
     try:
         result = client.query("SELECT engine FROM system.tables WHERE name = 'train_delays' AND database = 'default'")
         if result.result_rows:
-            current_engine = result.result_rows[0][0]
-            if 'ReplacingMergeTree' not in current_engine:
-                print(f"⚠ Миграция: train_delays использует {current_engine}, нужен ReplacingMergeTree")
-                print("🔄 Пересоздаём таблицу train_delays...")
+            engine = result.result_rows[0][0]
+            if 'ReplacingMergeTree' not in engine:
+                print(f"⚠ Migrating train_delays from {engine} to ReplacingMergeTree")
                 client.command("DROP TABLE IF EXISTS train_delays")
-    except Exception as e:
-        print(f"⚠ Ошибка проверки движка: {e}")
+    except:
+        pass
     
-    # Silver layer: train_delays (сырые данные)
-    # ReplacingMergeTree автоматически дедуплицирует по ORDER BY ключу
     client.command("""
         CREATE TABLE IF NOT EXISTS train_delays (
             timestamp DateTime,
@@ -78,7 +338,6 @@ def ensure_clickhouse_tables():
         PARTITION BY toYYYYMM(planned_departure)
     """)
     
-    # Gold layer: daily_train_stats (агрегированные данные)
     client.command("""
         CREATE TABLE IF NOT EXISTS daily_train_stats (
             stat_date Date,
@@ -94,256 +353,140 @@ def ensure_clickhouse_tables():
         PARTITION BY toYYYYMM(stat_date)
     """)
     
-    print("✅ ClickHouse tables ensured: train_delays, daily_train_stats")
+    print("✅ ClickHouse tables ready")
 
-# --- ЛОГИРОВАНИЕ ---
-def log_status(context, stage, status, msg=""):
-    """Пишет статус этапа в консоль и в Postgres."""
-    print(f"[{stage}] {status}: {msg}")
+
+def run_silver_dq_checks(records: list) -> dict:
+    """
+    Run data quality checks on parsed records.
     
-    try:
-        pg_hook = PostgresHook(postgres_conn_id='postgres_default')
-        sql = """
-            INSERT INTO api_ingestion_log (dag_id, execution_date, status, error_message)
-            VALUES (%s, %s, %s, %s)
-        """
-        dag_id = str(context['dag'].dag_id)
-        execution_date = str(context.get('execution_date', datetime.now()))
+    Returns dict with:
+    - critical_failures: list of critical errors (pipeline should fail)
+    - warnings: list of warnings (logged but pipeline continues)
+    - clean_records: filtered records that passed all checks
+    """
+    results = {
+        'critical_failures': [],
+        'warnings': [],
+        'clean_records': [],
+        'stats': {}
+    }
+    
+    clean = []
+    
+    # Counters for DQ metrics
+    null_train_id = 0
+    null_city = 0
+    null_time = 0
+    extreme_delay = 0
+    future_data = 0
+    negative_extreme = 0
+    
+    now = datetime.now()
+    max_future = now + timedelta(days=7)
+    
+    for r in records:
+        # r = (timestamp, city, train_type, train_id, planned_departure, 
+        #      actual_departure, delay_in_min, is_cancelled, origin, destination)
         
-        pg_hook.run("""
-            CREATE TABLE IF NOT EXISTS api_ingestion_log (
-                run_id SERIAL PRIMARY KEY,
-                dag_id VARCHAR(50),
-                execution_date VARCHAR(50),
-                status VARCHAR(20),
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        """)
+        timestamp, city, train_type, train_id, planned_dep, actual_dep, delay, cancelled, origin, dest = r
         
-        pg_hook.run(sql, parameters=(dag_id, execution_date, status, f"{stage}: {msg}"))
-    except Exception as e:
-        print(f"⚠ Ошибка записи лога в Postgres: {e}")
-
-# ==========================================
-# 1. EXTRACT DATA (API -> Parquet/Bronze)
-# ==========================================
-async def extract_data(config):
-    """
-    Загружает данные из двух источников:
-    1. /plan/{evaNo}/{YYMMDD}/{HH} - ВСЕ запланированные поезда
-    2. /fchg/{evaNo} - актуальные изменения (задержки, отмены)
-    
-    Потом данные объединяются в load_to_silver.
-    """
-    from api_client import generate_plan_queries, generate_fchg_queries, fetch_and_save
-    
-    stations = config.get("stations", {})
-    hours_back = config.get("hours_back", 24)
-    hours_forward = config.get("hours_forward", 0)
-    
-    # 1. Генерируем запросы для плана (все поезда)
-    plan_queries = generate_plan_queries(
-        stations=stations,
-        hours_back=hours_back,
-        hours_forward=hours_forward,
-    )
-    
-    # 2. Генерируем запросы для изменений (задержки)
-    fchg_queries = generate_fchg_queries(stations=stations)
-    
-    # Объединяем все запросы
-    all_queries = plan_queries + fchg_queries
-    
-    print(f"🌍 TASK 1: EXTRACT. Загрузка данных:")
-    print(f"   - Станций: {len(stations)}")
-    print(f"   - План запросов: {len(plan_queries)} (часы: -{hours_back} / +{hours_forward})")
-    print(f"   - Изменения запросов: {len(fchg_queries)}")
-    print(f"   - Всего запросов: {len(all_queries)}")
-    
-    return await fetch_and_save(
-        queries=all_queries,
-        output_path="/opt/airflow/data/raw_api_data",
-        max_concurrent=10,
-        rate_limit=60,
-    )
-
-# ==========================================
-# 2. LOAD TO SILVER (Parquet -> ClickHouse Raw)
-# ==========================================
-def load_to_silver(df, config):
-    """
-    Парсит XML ответы и загружает в ClickHouse.
-    
-    Логика объединения:
-    1. Парсим /plan данные -> базовое расписание (delay=0)
-    2. Парсим /fchg данные -> изменения с реальными задержками
-    3. Объединяем: fchg данные перезаписывают plan по ключу (train_id, planned_departure, city)
-    """
-    print("📥 TASK 2: LOAD TO SILVER...")
-    
-    target_types = set(config.get("monitored_types", []))
-    
-    # Словарь для хранения данных: ключ -> данные
-    # Ключ: (train_id, planned_departure, city)
-    trains_dict = {}
-    
-    plan_count = 0
-    fchg_count = 0
-    error_count = 0
-    
-    for _, row in df.iterrows():
-        if row['error']:
-            error_count += 1
-            continue
-            
-        if not row['response_data']:
+        # Check 1: Null train_id
+        if not train_id or train_id.strip() == '':
+            null_train_id += 1
             continue
         
-        station_name = row.get('station_name', 'Unknown')
-        query_type = row.get('query_type', 'plan')
+        # Check 2: Null city
+        if not city or city.strip() == '' or city == 'Unknown':
+            null_city += 1
+            continue
         
-        try:
-            # Выбираем парсер в зависимости от типа запроса
-            if query_type == 'fchg':
-                rows = parse_fchg_xml(row['response_data'], station_name)
-                fchg_count += len(rows)
-            else:
-                rows = parse_plan_xml(row['response_data'], station_name)
-                plan_count += len(rows)
-            
-            # Фильтруем по типу поезда если нужно
-            if target_types:
-                rows = [r for r in rows if r[2] in target_types]
-            
-            # Добавляем в словарь
-            for row_data in rows:
-                # row_data: (timestamp, city, train_type, train_id, planned_departure, 
-                #            actual_departure, delay_in_min, is_cancelled, origin, destination)
-                key = (row_data[3], row_data[4], row_data[1])  # (train_id, planned_departure, city)
-                
-                # fchg данные имеют приоритет (перезаписывают plan)
-                if query_type == 'fchg':
-                    trains_dict[key] = row_data
-                elif key not in trains_dict:
-                    # plan данные добавляем только если ещё нет записи
-                    trains_dict[key] = row_data
-            
-        except Exception as e:
-            print(f"⚠ Ошибка парсинга для {station_name}: {e}")
-            error_count += 1
+        # Check 3: Null planned_departure
+        if not planned_dep:
+            null_time += 1
+            continue
+        
+        # Check 4: Extreme positive delay (>1000 min = 16+ hours)
+        if delay > 1000:
+            extreme_delay += 1
+            continue
+        
+        # Check 5: Extreme negative delay (<-60 min)
+        if delay < -60:
+            negative_extreme += 1
+            continue
+        
+        # Check 6: Future data (>7 days)
+        if planned_dep > max_future:
+            future_data += 1
+            continue
+        
+        # Record passed all checks
+        clean.append(r)
     
-    print(f"📊 Парсинг завершён:")
-    print(f"   - Plan записей: {plan_count}")
-    print(f"   - Fchg записей (с изменениями): {fchg_count}")
-    print(f"   - Ошибок: {error_count}")
-    print(f"   - Уникальных поездов после объединения: {len(trains_dict)}")
+    # Log stats
+    total = len(records)
+    removed = total - len(clean)
     
-    if not trains_dict:
-        print("⚠ LOAD: Нет данных для вставки.")
-        return 0
+    print(f"   ├─ Null train_id: {null_train_id}")
+    print(f"   ├─ Null/Unknown city: {null_city}")
+    print(f"   ├─ Null planned_time: {null_time}")
+    print(f"   ├─ Extreme delay (>1000min): {extreme_delay}")
+    print(f"   ├─ Extreme negative (<-60min): {negative_extreme}")
+    print(f"   ├─ Future data (>7days): {future_data}")
+    print(f"   └─ Total removed: {removed} ({removed/total*100:.1f}%)")
+    
+    # Critical failure if too many bad records
+    bad_rate = removed / total if total > 0 else 0
+    if bad_rate > 0.5:
+        results['critical_failures'].append(f"Too many bad records: {bad_rate*100:.1f}%")
+    
+    # Critical failure if no clean records
+    if len(clean) == 0:
+        results['critical_failures'].append("No clean records after DQ")
+    
+    results['clean_records'] = clean
+    results['stats'] = {
+        'total': total,
+        'clean': len(clean),
+        'removed': removed,
+        'null_train_id': null_train_id,
+        'null_city': null_city,
+        'extreme_delay': extreme_delay,
+    }
+    
+    return results
 
-    # Преобразуем обратно в список
-    all_parsed = list(trains_dict.values())
-    
-    # Статистика по задержкам
-    delayed_count = sum(1 for r in all_parsed if r[6] > 0)
-    cancelled_count = sum(1 for r in all_parsed if r[7] == 1)
-    print(f"   - С задержкой: {delayed_count}")
-    print(f"   - Отменено: {cancelled_count}")
 
+# =============================================================================
+# GOLD LAYER: Aggregation for Analytics
+# =============================================================================
+
+def gold_aggregate(**context):
+    """
+    GOLD LAYER: Create aggregated metrics for dashboards.
+    
+    - Daily statistics per city and train type
+    - Pre-computed KPIs
+    - Optimized for BI queries
+    """
+    print("=" * 60)
+    print("🥇 GOLD LAYER: Starting aggregation")
+    print("=" * 60)
+    
     client = get_ch_client()
     
-    client.insert('train_delays', all_parsed, 
-                  column_names=['timestamp', 'city', 'train_type', 'train_id', 
-                                'planned_departure', 'actual_departure', 
-                                'delay_in_min', 'is_cancelled', 'origin', 'destination'])
+    # Delete existing data for today and yesterday (will be replaced)
+    print("🗑 Clearing old Gold data...")
+    client.command("""
+        ALTER TABLE daily_train_stats DELETE 
+        WHERE stat_date >= toDate(now() - INTERVAL 1 DAY)
+    """)
     
-    print(f"✅ LOAD: Вставлено {len(all_parsed)} строк в Silver слой (train_delays).")
-    return len(all_parsed)
-
-# ==========================================
-# 3. DATA QUALITY CHECK (Validation)
-# ==========================================
-def data_quality_check():
-    print("🧐 TASK 3: DATA QUALITY CHECK...")
-    client = get_ch_client()
+    # Aggregate from Silver to Gold
+    # DB Standard: delay > 5 minutes = officially late
+    print("📊 Aggregating Silver -> Gold...")
     
-    # Критические проверки (роняют пайплайн)
-    critical_checks = [
-        ("Null Check: Train IDs", 
-         "SELECT count() FROM train_delays FINAL WHERE train_id = '' AND timestamp > now() - INTERVAL 1 HOUR"),
-         
-        ("Null Check: Cities", 
-         "SELECT count() FROM train_delays FINAL WHERE city = '' AND timestamp > now() - INTERVAL 1 HOUR"),
-
-        ("Range Check: Negative Delays", 
-         "SELECT count() FROM train_delays FINAL WHERE delay_in_min < -60"),
-         
-        ("Range Check: Extreme Delays (>1000 min)", 
-         "SELECT count() FROM train_delays FINAL WHERE delay_in_min > 1000"),
-         
-        ("Range Check: Future Data (>7 Days)", 
-         "SELECT count() FROM train_delays FINAL WHERE planned_departure > now() + INTERVAL 7 DAY"),
-
-        ("Ref Integrity: Unknown Stations", 
-         "SELECT count() FROM train_delays FINAL WHERE city = 'Unknown' AND timestamp > now() - INTERVAL 1 HOUR"),
-    ]
-    
-    # Предупреждения (не роняют пайплайн)
-    warning_checks = [
-        ("Duplicates (pre-merge)",
-         """SELECT count() FROM (
-             SELECT train_id, planned_departure, city, count() as cnt 
-             FROM train_delays
-             WHERE timestamp > now() - INTERVAL 1 HOUR
-             GROUP BY train_id, planned_departure, city 
-             HAVING cnt > 1
-         )"""),
-    ]
-    
-    failed_checks = []
-    
-    for check_name, sql in critical_checks:
-        try:
-            result = client.query(sql).result_rows[0][0]
-            if result > 0:
-                msg = f"❌ DQ FAIL: {check_name} -> найдено {result} плохих записей"
-                print(msg)
-                failed_checks.append(msg)
-            else:
-                print(f"✅ DQ PASS: {check_name}")
-        except Exception as e:
-            print(f"⚠ Ошибка при выполнении проверки {check_name}: {e}")
-            failed_checks.append(f"SQL Error in {check_name}: {e}")
-    
-    for check_name, sql in warning_checks:
-        try:
-            result = client.query(sql).result_rows[0][0]
-            if result > 0:
-                print(f"⚠ DQ WARNING: {check_name} -> {result} записей (будут дедуплицированы)")
-            else:
-                print(f"✅ DQ PASS: {check_name}")
-        except Exception as e:
-            print(f"⚠ Ошибка при выполнении проверки {check_name}: {e}")
-    
-    try:
-        client.command("OPTIMIZE TABLE train_delays FINAL")
-        print("✅ OPTIMIZE TABLE train_delays FINAL - дедупликация выполнена")
-    except Exception as e:
-        print(f"⚠ OPTIMIZE не выполнен: {e}")
-            
-    if failed_checks:
-        raise Exception(f"Data Quality Checks Failed:\n" + "\n".join(failed_checks))
-
-# ==========================================
-# 4. TRANSFORM GOLD (Silver -> Aggregated)
-# ==========================================
-def transform_gold():
-    print("🔨 TASK 4: TRANSFORM GOLD...")
-    client = get_ch_client()
-    
-    # Стандарт Deutsche Bahn: поезд считается опоздавшим если задержка > 5 минут
     query = """
     INSERT INTO daily_train_stats
     SELECT
@@ -359,75 +502,68 @@ def transform_gold():
     WHERE planned_departure >= toStartOfDay(now() - INTERVAL 1 DAY)
       AND planned_departure < toStartOfDay(now() + INTERVAL 1 DAY)
     GROUP BY stat_date, city, train_type
+    HAVING total_trains > 0
     """
     
-    # Удаляем старые данные за сегодня и вчера перед вставкой
-    client.command("""
-        ALTER TABLE daily_train_stats DELETE 
-        WHERE stat_date >= toDate(now() - INTERVAL 1 DAY)
-    """)
-    
     client.command(query)
-    print("✅ TRANSFORM: Gold слой (daily_train_stats) обновлен.")
-
-# --- ORCHESTRATOR ---
-async def run_pipeline(context):
-    config = load_config()
     
-    # 0. ENSURE TABLES EXIST
-    try:
-        ensure_clickhouse_tables()
-    except Exception as e:
-        log_status(context, "INIT", "FAILED", f"Cannot create tables: {e}")
-        raise
+    # Get stats for logging
+    stats = client.query("""
+        SELECT 
+            count() as rows,
+            sum(total_trains) as trains,
+            sum(delayed_trains) as delayed
+        FROM daily_train_stats FINAL
+        WHERE stat_date = toDate(now())
+    """).result_rows[0]
     
-    # 1. EXTRACT
-    try:
-        df = await extract_data(config)
-        
-        # Tech Check: API health
-        total = len(df)
-        failed_count = df['error'].notna().sum()
-        
-        if total == 0:
-            raise Exception("CRITICAL: Не сгенерировано ни одного запроса.")
-            
-        if failed_count == total:
-            raise Exception("CRITICAL: Все запросы к API упали.")
-            
-        success_rate = (total - failed_count) / total * 100
-        print(f"📈 API Success Rate: {success_rate:.1f}% ({total - failed_count}/{total})")
-        
-        if failed_count > 0:
-            print(f"⚠ WARNING: {failed_count}/{total} запросов с ошибкой.")
-            
-    except Exception as e:
-        log_status(context, "EXTRACT", "FAILED", str(e))
-        raise
+    rows, trains, delayed = stats
+    delay_rate = (delayed / trains * 100) if trains > 0 else 0
+    
+    print(f"\n📈 Gold layer statistics (today):")
+    print(f"   - Aggregation rows: {rows}")
+    print(f"   - Total trains: {trains}")
+    print(f"   - Delayed trains: {delayed} ({delay_rate:.1f}%)")
+    
+    log_pipeline_stage(DAG_ID, 'gold', 'SUCCESS', int(trains or 0))
+    
+    return int(trains or 0)
 
-    # 2. LOAD
-    try:
-        count = load_to_silver(df, config)
-    except Exception as e:
-        log_status(context, "LOAD", "FAILED", str(e))
-        raise
 
-    # 3. DQ CHECK
-    if count > 0:
-        try:
-            data_quality_check()
-        except Exception as e:
-            log_status(context, "DQ_CHECK", "FAILED", str(e))
-            raise
+# =============================================================================
+# DAG DEFINITION
+# =============================================================================
 
-        # 4. TRANSFORM
-        try:
-            transform_gold()
-        except Exception as e:
-            log_status(context, "TRANSFORM", "FAILED", str(e))
-            raise
-            
-    log_status(context, "PIPELINE", "SUCCESS", f"Processed {count} records")
-
-def main(**kwargs):
-    asyncio.run(run_pipeline(kwargs))
+with DAG(
+    dag_id=DAG_ID,
+    default_args=default_args,
+    description='Deutsche Bahn train delays: Bronze -> Silver -> Gold pipeline',
+    schedule_interval='*/30 * * * *',  # Every 30 minutes
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['deutsche-bahn', 'medallion', 'trains'],
+) as dag:
+    
+    # Task 1: Bronze - Extract raw data
+    bronze_task = PythonOperator(
+        task_id='bronze_extract',
+        python_callable=bronze_extract,
+        provide_context=True,
+    )
+    
+    # Task 2: Silver - Transform and validate
+    silver_task = PythonOperator(
+        task_id='silver_transform',
+        python_callable=silver_transform,
+        provide_context=True,
+    )
+    
+    # Task 3: Gold - Aggregate for analytics
+    gold_task = PythonOperator(
+        task_id='gold_aggregate',
+        python_callable=gold_aggregate,
+        provide_context=True,
+    )
+    
+    # Define dependencies: Bronze -> Silver -> Gold
+    bronze_task >> silver_task >> gold_task
