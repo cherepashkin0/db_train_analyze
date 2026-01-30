@@ -1,4 +1,0 @@
-clickhouse-connect
-numpy
-pandas
-dotenv
